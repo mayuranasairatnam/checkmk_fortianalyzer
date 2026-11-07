@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""
+FortiAnalyzer HTTPS JSON-RPC collector; no third party HTTP dependencies.
+"""
+import argparse
+import json
+import math
+import socket
+import re
+import subprocess
+import time
+from datetime import date
+import ssl
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+
+class APIError(Exception):
+    """
+    API transport, authentication or response validation failure.
+
+    Input:
+        Error message and optional exception arguments.
+
+    Output:
+        APIError instance.
+
+    """
+    pass
+
+
+def error_code(raw):
+    """
+    Extract a safe numeric code from an API error.
+
+    Input:
+        raw: Unprocessed value or API response.
+
+    Output:
+        Formatted code suffix, or an empty string if no integer code is present.
+
+    """
+    code = raw.get('code') if isinstance(raw, dict) else None
+    return f' (code {code})' if isinstance(code, int) and not isinstance(code, bool) else ''
+
+
+class NoRedirect(HTTPRedirectHandler):
+    """
+    HTTP handler that prevents credential forwarding through redirects.
+
+    Input:
+        Constructor arguments supported by the base class.
+
+    Output:
+        NoRedirect instance.
+
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """
+        Decline redirects to avoid forwarding session credentials.
+
+        Input:
+            req: Original HTTP request.
+            fp: Response stream supplied by urllib.
+            code: HTTP redirect status code.
+            msg: Message to log or HTTP status text.
+            headers: HTTP response headers.
+            newurl: Redirect target supplied by the server.
+
+        Output:
+            None; urllib does not construct a redirected request.
+
+        """
+        # Never forward credentials or the session cookie to another endpoint.
+        return None
+
+
+class Client:
+    """
+    HTTPS JSON-RPC client with explicit session and error handling.
+
+    Input:
+        address: Target hostname or IP address without a scheme or path.
+        port: Target TCP port.
+        timeout: Maximum wait time in seconds.
+        verify: Whether to verify the TLS certificate and hostname.
+        ca_file: Optional path to a trusted CA certificate bundle.
+        api_token: Optional Bearer token, used instead of session authentication.
+
+    Output:
+        Client instance.
+
+    """
+    def __init__(self, address, port=443, timeout=30, verify=True, ca_file=None, api_token=None):
+        """
+        Initialize the Client instance.
+
+        Input:
+            address: Target hostname or IP address without a scheme or path.
+            port: Target TCP port.
+            timeout: Maximum wait time in seconds.
+            verify: Whether to verify the TLS certificate and hostname.
+            ca_file: Optional path to a trusted CA certificate bundle.
+
+        Output:
+            None; initializes instance attributes for subsequent operations.
+
+        """
+        if any(c in address for c in '/@?#\r\n'):
+            raise APIError('Invalid API address: use a hostname or IP address')
+        host = '[' + address + ']' if ':' in address and not address.startswith('[') else address
+        self.base = f'https://{host}:{port}'
+        context = ssl.create_default_context(cafile=ca_file)
+        if not verify:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        self.opener = build_opener(ProxyHandler({}), HTTPSHandler(context=context), NoRedirect())
+        self.timeout = timeout
+        if api_token is not None and (not isinstance(api_token, str) or not api_token
+                                      or any(not 33 <= ord(c) <= 126 for c in api_token)):
+            raise APIError('Invalid API token')
+        self.api_token = api_token
+        self.session = None
+        self.request_id = 0
+
+    def call(self, url, method='get', data=None, gui=False, require_data=True, apiver=None):
+        """
+        Execute and validate a JSON-RPC or GUI proxy request.
+
+        Input:
+            url: API resource path.
+            method: JSON-RPC operation to execute.
+            data: Payload to process.
+            gui: Whether to use the GUI proxy envelope and session cookie.
+            require_data: Whether a response without data is an error.
+            apiver: Optional API version included in the request.
+
+        Output:
+            Decoded result data; raises APIError for transport, status or response errors.
+
+        """
+        self.request_id += 1
+        param = {'url': url}
+        if apiver is not None:
+            param['apiver'] = apiver
+        if data is not None:
+            param['data'] = data
+        # flatui_proxy accepts the GUI's flat envelope, not JSON-RPC params.
+        body = {'method': method, **param} if gui else {
+            'id': self.request_id, 'method': method, 'params': [param]}
+        if not gui:
+            body['jsonrpc'] = '2.0'
+        headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
+        if self.api_token:
+            headers['Authorization'] = 'Bearer ' + self.api_token
+        elif self.session:
+            if gui:
+                headers['Cookie'] = 'CURRENT_SESSION=' + self.session
+            else:
+                body['session'] = self.session
+        endpoint = '/cgi-bin/module/flatui_proxy' if gui else '/jsonrpc'
+        request = Request(self.base + endpoint, data=json.dumps(body).encode(), headers=headers, method='POST')
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                raw = response.read(16 * 1024 * 1024 + 1)
+            if len(raw) > 16 * 1024 * 1024:
+                raise APIError('API response exceeds 16 MiB')
+            payload = json.loads(raw)
+        except HTTPError as exc:
+            raise APIError(f'HTTP {exc.code} for {url}') from None
+        except (TimeoutError, socket.timeout):
+            raise APIError(f'Timeout for {url}') from None
+        except URLError as exc:
+            reason = 'TLS verification failed' if isinstance(exc.reason, ssl.SSLError) else 'Connection failed'
+            raise APIError(f'{reason} for {url}') from None
+        except (OSError, ValueError):
+            raise APIError(f'Invalid response or transport error for {url}') from None
+        if not isinstance(payload, dict):
+            raise APIError(f'JSON-RPC error for {url}')
+        if payload.get('error') is not None:
+            raise APIError(f'JSON-RPC error{error_code(payload["error"])} for {url}')
+        results = payload.get('result')
+        if isinstance(results, dict):
+            results = [results]
+        if not isinstance(results, list) or len(results) != 1 or not isinstance(results[0], dict):
+            raise APIError(f'Missing API result for {url}')
+        result = results[0]
+        if result.get('error') is not None:
+            raise APIError(f'API error{error_code(result["error"])} for {url}')
+        status = result.get('status')
+        logview_success = (apiver == 3 and url.startswith('/logview/adom/')
+                           and url.endswith('/logstats') and 'status' not in result)
+        if not logview_success and (not isinstance(status, dict) or isinstance(status.get('code'), bool) or status.get('code') not in (0, '0')):
+            # Do not echo arbitrary server messages: they can contain credentials.
+            raise APIError(f'API returned a non-success or missing status for {url}')
+        if url == '/sys/login/user':
+            session = payload.get('session')
+            if not isinstance(session, str) or not session or any(c in session for c in '\r\n;'):
+                raise APIError('Authentication failed: missing or invalid session')
+            self.session = session
+        if require_data and ('data' not in result or result['data'] is None):
+            raise APIError(f'Missing API data for {url}')
+        return result.get('data')
+
+    def login(self, user, password):
+        """
+        Authenticate the API client and retain the resulting session.
+
+        Input:
+            user: Account name used for authentication.
+            password: Password used for authentication.
+
+        Output:
+            None; updates the client session or raises on authentication failure.
+
+        """
+        if self.api_token:
+            return
+        self.call('/sys/login/user', 'exec', {'user': user, 'passwd': password}, require_data=False)
+
+    def logout(self):
+        """
+        Close the API session and clear the local session identifier.
+
+        Input:
+            Current instance state.
+
+        Output:
+            None; clears the session even if the remote logout fails.
+
+        """
+        try:
+            if self.session and not self.api_token:
+                self.call('/sys/logout', 'exec', require_data=False)
+        finally:
+            self.session = None
+
+
+def object_data(data):
+    """
+    Validate an API object, unwrapping a single-element list.
+
+    Input:
+        data: Payload to process.
+
+    Output:
+        Non-empty dictionary; raises APIError for an invalid response shape.
+
+    """
+    if isinstance(data, list) and len(data) == 1:
+        data = data[0]
+    if not isinstance(data, dict) or not data:
+        raise APIError('Expected a non-empty API object')
+    return data
+
+
+def list_data(data):
+    """
+    Validate a list of API objects.
+
+    Input:
+        data: Payload to process.
+
+    Output:
+        List of dictionaries; raises APIError if the payload has an invalid shape.
+
+    """
+    if not isinstance(data, list) or any(not isinstance(entry, dict) for entry in data):
+        raise APIError('Expected an API object list')
+    return data
+
+
+SYSTEM_KEYS = ('Hostname', 'Max Number of Admin Domains', 'Platform Type', 'Serial Number', 'Version')
+
+
+def logstats_data(raw):
+    """
+    Aggregate device and VDOM log rates while recording missing coverage.
+
+    Input:
+        raw: Unprocessed value or API response.
+
+    Output:
+        Dictionary of rate, device and VDOM counts, with missing_vdoms when needed;
+        raises APIError for invalid values or structures.
+
+    """
+    data = object_data(raw)
+    devices = list_data(data.get('devs'))
+    rates = []
+    vdom_count = 0
+    missing = 0
+    for device in devices:
+        vdoms = list_data(device.get('vdoms'))
+        vdom_count += len(vdoms)
+        for vdom in vdoms:
+            if 'lograte' not in vdom:
+                missing += 1
+                continue
+            value = vdom.get('lograte')
+            if isinstance(value, bool) or value is None:
+                raise APIError('Missing or invalid VDOM lograte')
+            try:
+                rate = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise APIError('Missing or invalid VDOM lograte') from None
+            if not math.isfinite(rate) or rate < 0:
+                raise APIError('Missing or invalid VDOM lograte')
+            rates.append(rate)
+    try:
+        total = math.fsum(rates)
+    except OverflowError:
+        raise APIError('Lograte sum overflow') from None
+    result = {'logs_per_second': total, 'devices': len(devices), 'vdoms': vdom_count}
+    if missing:
+        result['missing_vdoms'] = missing
+    return result
+
+
+def collect(client, user, password, exclude_adoms=()):
+    """
+    Collect monitoring data while preserving partial failures and closing the session.
+
+    Input:
+        client: Client used to obtain API or SSH data.
+        user: Account name used for authentication.
+        password: Password used for authentication.
+        exclude_adoms: ADOM names to exclude from collection.
+
+    Output:
+        Section dictionary containing collected data and API error diagnostics.
+
+    """
+    token_mode = bool(getattr(client, 'api_token', None))
+    section = {'authentication': 'token' if token_mode else 'password'}
+    errors = []
+    try:
+        if not token_mode:
+            client.login(user, password)
+        for key, url, gui in (
+            ('system', '/sys/status', False),
+            ('license', '/gui/sys/license', True),
+            ('resources', '/gui/sys/resource/realtime', True),
+        ):
+            if token_mode and gui:
+                continue
+            try:
+                data = object_data(client.call(url, gui=gui))
+                if key == 'system':
+                    data = {k: data[k] for k in SYSTEM_KEYS if k in data}
+                elif key == 'license':
+                    data = {k: data[k] for k in ('current_num_dev', 'max_num_dev', 'dev_num_count', 'licenses') if k in data}
+                else:
+                    data = {k: data[k] for k in ('cpu_avg', 'disk', 'memory', 'memory_used', 'memory_total') if k in data}
+                section[key] = {'data': data}
+            except APIError as exc:
+                section[key] = {'error': str(exc)}
+                errors.append(str(exc))
+        try:
+            adoms = list_data(client.call('/dvmdb/adom'))
+            names = [entry.get('name') for entry in adoms]
+            if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+                raise APIError('Invalid or duplicate ADOM name in API response')
+            excluded = sorted(set(names).intersection(exclude_adoms))
+            section['adoms'] = {'data': {}, 'excluded': excluded}
+            for name in names:
+                if name in excluded:
+                    continue
+                try:
+                    stats = client.call('/logview/adom/' + quote(name, safe='') + '/logstats', apiver=3)
+                    section['adoms']['data'][name] = logstats_data(stats)
+                except APIError as exc:
+                    message = f'ADOM {name}: {exc}'
+                    section['adoms']['data'][name] = {'error': message}
+                    errors.append(message)
+        except APIError as exc:
+            section['adoms'] = {'error': str(exc)}
+            errors.append(str(exc))
+    except APIError as exc:
+        message = 'Authentication failed: ' + str(exc)
+        errors.append(message)
+        for key in ('system', 'license', 'resources', 'adoms'):
+            section[key] = {'error': message}
+    finally:
+        try:
+            if not getattr(client, 'api_token', None):
+                client.logout()
+        except APIError as exc:
+            errors.append('Logout failed: ' + str(exc))
+    section['api'] = {'errors': errors}
+    return section
+
+
+class LogVolumeParseError(ValueError):
+    """
+    Invalid or incomplete CLI log-volume response.
+
+    Input:
+        Error message and optional exception arguments.
+
+    Output:
+        LogVolumeParseError instance.
+
+    """
+    pass
+
+
+def parse_logvolume(text):
+    """
+    Parse dated CLI log-volume counters into GB per day.
+
+    Input:
+        text: Text to parse.
+
+    Output:
+        Mapping of ADOM names to date, gb_day, average_gb_day and history;
+        raises LogVolumeParseError for missing or malformed volume data.
+
+    """
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    text = re.sub(r'.\x08', '', text)
+    dates = None
+    pending = None
+    rows = {}
+    units = {'B': 1, 'KB': 1024, 'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
+    for line in text.splitlines():
+        line = line.strip()
+        if re.fullmatch(r'(?:\d{4}-\d{2}-\d{2}\s+)+average', line):
+            if dates is not None:
+                raise LogVolumeParseError('Duplicate log-volume date header')
+            dates = line.split()[:-1]
+            parsed = [date.fromisoformat(value) for value in dates]
+            if len(set(parsed)) != len(parsed) or parsed != sorted(parsed, reverse=True):
+                raise LogVolumeParseError('Invalid log-volume dates')
+            continue
+        match = re.fullmatch(r"adom '(.+)':", line)
+        if match:
+            if dates is None or pending is not None or match[1] in rows:
+                raise LogVolumeParseError('Invalid ADOM log-volume block')
+            pending = match[1]
+            continue
+        if pending is not None:
+            if not line:
+                continue
+            cells = re.findall(r'([0-9]+(?:\.[0-9]+)?)\s*(TB|GB|MB|KB|B)', line)
+            remainder = re.sub(r'([0-9]+(?:\.[0-9]+)?)\s*(TB|GB|MB|KB|B)', '', line)
+            if len(cells) != len(dates) + 1 or remainder.strip():
+                raise LogVolumeParseError('Invalid ADOM log-volume values')
+            values = [float(value) * units[unit] / 1e9 for value, unit in cells]
+            if any(not math.isfinite(value) for value in values):
+                raise LogVolumeParseError('Invalid ADOM log-volume values')
+            rows[pending] = {'date': dates[0], 'gb_day': values[0], 'average_gb_day': values[-1],
+                             'history': dict(zip(dates, values[:-1]))}
+            pending = None
+    if dates is None or pending is not None or not rows:
+        raise LogVolumeParseError('Missing or incomplete SSH log-volume data')
+    return rows
+
+
+def ssh_error(stderr, returncode):
+    """
+    Classify an OpenSSH failure without exposing arbitrary remote output.
+
+    Input:
+        stderr: Captured OpenSSH standard error text.
+        returncode: OpenSSH process exit status.
+
+    Output:
+        Safe error description based on known error patterns or the exit status.
+
+    """
+    message = stderr.lower()
+    categories = (
+        (('remote host identification has changed',), 'Host key changed; verify the new fingerprint before updating known_hosts'),
+        (('host key verification failed', 'no host key is known'), 'Host key missing or untrusted; check the site user known_hosts file'),
+        (('identity file', 'no such file'), 'SSH identity file unavailable; check its path and site user permissions'),
+        (('unprotected private key file', 'bad permissions'), 'SSH private key permissions too open; set owner to the site user and mode 600'),
+        (('invalid format', 'error in libcrypto'), 'SSH private key cannot be read; check the key format'),
+        (('incorrect passphrase', 'enter passphrase'), 'SSH key requires unlocking; unattended SSH needs an accessible key or agent'),
+        (('permission denied (publickey', 'permission denied (password', 'permission denied (keyboard-interactive'), 'SSH authentication rejected; check user, authorized public key and key availability (an encrypted key needs an agent)'),
+        (('connection refused',), 'SSH connection refused; check address, port and SSH access on FortiAnalyzer'),
+        (('could not resolve hostname',), 'SSH hostname cannot be resolved by the Checkmk server'),
+        (('no route to host', 'network is unreachable'), 'SSH host unreachable from the Checkmk server'),
+        (('connection timed out', 'operation timed out'), 'SSH connection timed out'),
+        (('no matching host key type', 'no matching key exchange method', 'no matching cipher'), 'SSH algorithm negotiation failed; check client and FortiAnalyzer SSH compatibility'),
+    )
+    for needles, explanation in categories:
+        if any(needle in message for needle in needles):
+            return explanation
+    return f'SSH command failed (exit {returncode}); run the same command as the Checkmk site user for details'
+
+
+def collect_logvolume(address, user, identity_file, port=22, timeout=30, known_hosts=None, excluded=()):
+    """
+    Collect ADOM log volumes over SSH using a private key.
+
+    Input:
+        address: Target hostname or IP address without a scheme or path.
+        user: Account name used for authentication.
+        identity_file: Path to the private key used for SSH authentication.
+        port: Target TCP port.
+        timeout: Maximum wait time in seconds.
+        known_hosts: Optional path to the SSH known_hosts file.
+        excluded: ADOM names to exclude from the returned volume data.
+
+    Output:
+        Dictionary containing data and excluded ADOMs, or an error description.
+
+    """
+    # No shell, fixed remote command, key authentication, verified host keys.
+    if not re.fullmatch(r'[A-Za-z0-9_.:-]+', address) or address.startswith('-'):
+        return {'error': 'Invalid SSH address'}
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', user) or user.startswith('-'):
+        return {'error': 'Invalid SSH user'}
+    args = ['ssh', '-F', '/dev/null', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+            '-o', 'IdentitiesOnly=yes', '-o', 'PasswordAuthentication=no',
+            '-o', 'ConnectTimeout=' + str(timeout), '-i', identity_file, '-p', str(port), '-l', user]
+    if known_hosts:
+        args.extend(['-o', 'UserKnownHostsFile=' + known_hosts])
+    args.extend([address, 'diagnose fortilogd logvol-adom all'])
+    try:
+        process = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, encoding='utf-8', errors='replace', timeout=timeout, check=False)
+        if process.returncode:
+            return {'error': ssh_error(process.stderr, process.returncode)}
+        data = parse_logvolume(process.stdout)
+        removed = sorted(set(data).intersection(excluded))
+        return {'data': {key: value for key, value in data.items() if key not in removed}, 'excluded': removed}
+    except subprocess.TimeoutExpired:
+        return {'error': 'SSH log-volume query timed out'}
+    except OSError:
+        return {'error': 'Cannot execute SSH log-volume query'}
+    except ValueError as exc:
+        return {'error': str(exc)}
+
+
+def read_ssh_channel(channel, timeout):
+    """
+    Read bounded SSH command output until completion or timeout.
+
+    Input:
+        channel: Paramiko channel supplying command output and exit status.
+        timeout: Maximum wait time in seconds.
+
+    Output:
+        (stdout, stderr, exit_status); raises on timeout or oversized output.
+
+    """
+    deadline = time.monotonic() + timeout
+    output, errors = bytearray(), bytearray()
+    while True:
+        for ready, receive, target in ((channel.recv_ready, channel.recv, output),
+                                        (channel.recv_stderr_ready, channel.recv_stderr, errors)):
+            if ready():
+                target.extend(receive(32768))
+                if len(output) + len(errors) > 1024 * 1024:
+                    raise LogVolumeParseError('SSH response exceeds size limit')
+        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError()
+        time.sleep(0.02)
+    return output.decode('utf-8', errors='replace'), errors.decode('utf-8', errors='replace'), channel.recv_exit_status()
+
+
+def shell_logvolume(client, timeout):
+    """
+    Collect log volumes through an interactive CLI session.
+
+    Input:
+        client: Client used to obtain API or SSH data.
+        timeout: Maximum wait time in seconds.
+
+    Output:
+        Parsed ADOM volume mapping; closes the shell channel even on failure.
+
+    """
+    channel = client.invoke_shell(width=240, height=1000)
+    deadline = time.monotonic() + timeout
+    try:
+        def read_until_prompt():
+            """
+            Read the enclosing SSH shell until its CLI prompt appears.
+
+            Input:
+                SSH channel and deadline captured from the enclosing function.
+
+            Output:
+                Decoded CLI output without pager markers; raises on timeout, closure
+                or oversized output. Uses the enclosing channel and deadline.
+
+            """
+            output = bytearray()
+            while time.monotonic() < deadline:
+                if channel.recv_ready():
+                    chunk = channel.recv(32768)
+                    if not chunk:
+                        raise LogVolumeParseError('SSH shell closed before CLI response completed')
+                    output.extend(chunk)
+                    if len(output) > 1024 * 1024:
+                        raise LogVolumeParseError('SSH response exceeds size limit')
+                    text = output.decode('utf-8', errors='replace')
+                    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text).replace('\r', '')
+                    if '--More--' in chunk.decode('utf-8', errors='replace'):
+                        channel.sendall(' ')
+                    if re.search(r'(?:^|\n)[^\n]{1,120}# *$', text):
+                        return text.replace('--More--', '')
+                elif channel.closed:
+                    raise LogVolumeParseError('SSH shell closed before CLI response completed')
+                time.sleep(0.02)
+            raise TimeoutError()
+        read_until_prompt()
+        channel.sendall('diagnose fortilogd logvol-adom all\n')
+        return parse_logvolume(read_until_prompt())
+    finally:
+        channel.close()
+
+
+def collect_logvolume_password(address, user, password, port=22, timeout=30, known_hosts=None, excluded=(), verify_host_key=False):
+    """
+    Collect ADOM log volumes using SSH password authentication.
+
+    Input:
+        address: Target hostname or IP address without a scheme or path.
+        user: Account name used for authentication.
+        password: Password used for authentication.
+        port: Target TCP port.
+        timeout: Maximum wait time in seconds.
+        known_hosts: Optional path to the SSH known_hosts file.
+        excluded: ADOM names to exclude from the returned volume data.
+        verify_host_key: Whether to require a trusted SSH host key.
+
+    Output:
+        Dictionary containing data and excluded ADOMs, or an error description;
+        closes the SSH connection before returning.
+
+    """
+    try:
+        import paramiko
+    except ImportError:
+        return {'error': 'SSH password authentication requires Paramiko in the Checkmk Python environment'}
+    client = paramiko.SSHClient()
+    try:
+        if verify_host_key:
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            try:
+                client.load_host_keys(str(Path(known_hosts).expanduser() if known_hosts else Path.home() / '.ssh' / 'known_hosts'))
+            except (OSError, ValueError):
+                return {'error': 'Cannot read SSH known_hosts; check path and site user permissions'}
+        else:
+            # No known_hosts loaded or written: accept unknown and changed keys.
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(address, port=port, username=user, password=password,
+                       allow_agent=False, look_for_keys=False, timeout=timeout,
+                       banner_timeout=timeout, auth_timeout=timeout)
+        try:
+            stdin, stdout, stderr = client.exec_command('diagnose fortilogd logvol-adom all', timeout=timeout, get_pty=True)
+            stdin.close()
+            output, errors, status = read_ssh_channel(stdout.channel, timeout)
+            if status != 0:
+                raise LogVolumeParseError('SSH exec command did not complete successfully')
+            data = parse_logvolume(output)
+        except (LogVolumeParseError, paramiko.SSHException):
+            data = shell_logvolume(client, timeout)
+        removed = sorted(set(data).intersection(excluded))
+        return {'data': {key: value for key, value in data.items() if key not in removed}, 'excluded': removed}
+    except paramiko.BadHostKeyException:
+        return {'error': 'SSH host key changed; verify fingerprint and update known_hosts'}
+    except paramiko.AuthenticationException:
+        return {'error': 'SSH password authentication rejected; check SSH user and password'}
+    except (socket.timeout, TimeoutError):
+        return {'error': 'SSH log-volume query timed out'}
+    except paramiko.SSHException as exc:
+        if 'not found in known_hosts' in str(exc).lower():
+            return {'error': 'SSH host key missing from known_hosts; add the verified host key for the configured address and port'}
+        return {'error': 'SSH negotiation or remote command failed; check SSH access and CLI permissions'}
+    except OSError:
+        return {'error': 'SSH connection failed; check hostname, port and network access'}
+    except LogVolumeParseError as exc:
+        return {'error': 'Cannot parse SSH log-volume output: ' + str(exc)}
+    except ValueError:
+        return {'error': 'Invalid SSH connection parameters'}
+    finally:
+        client.close()
+
+
+class PasswordReferenceError(ValueError):
+    """
+    Invalid or inaccessible Checkmk password-store reference.
+
+    Input:
+        Error message and optional exception arguments.
+
+    Output:
+        PasswordReferenceError instance.
+
+    """
+    pass
+
+
+def password_from_reference(reference):
+    """
+    Resolve a password from a Checkmk password-store reference.
+
+    Input:
+        reference: Checkmk password reference combining an ID and an absolute file path.
+
+    Output:
+        Non-empty password string; raises PasswordReferenceError for invalid references
+        or inaccessible store data.
+
+    """
+    # An absolute filename starts after :/. IDs may themselves contain colons.
+    ident, separator, filename = reference.partition(':/')
+    if not separator or not ident or not filename:
+        raise PasswordReferenceError('invalid reference format; save the rule and activate changes')
+    from cmk.utils.password_store import lookup
+    try:
+        value = lookup(Path('/' + filename), ident)
+    except FileNotFoundError:
+        raise PasswordReferenceError('password-store file missing; activate changes') from None
+    except PermissionError:
+        raise PasswordReferenceError('password-store file not readable by site user') from None
+    except ValueError:
+        raise PasswordReferenceError('reference not found or store invalid; reselect authentication secret, save rule and activate changes') from None
+    except OSError:
+        raise PasswordReferenceError('password-store file cannot be read') from None
+    if not isinstance(value, str) or not value:
+        raise PasswordReferenceError('referenced password is empty or invalid')
+    return value
+
+
+def main(argv=None):
+    """
+    Run the special agent and emit Checkmk section data.
+
+    Input:
+        argv: Command-line arguments; None uses the process arguments.
+
+    Output:
+        Process exit status; writes collected sections to stdout and diagnostics to stderr.
+
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--address', required=True)
+    parser.add_argument('--port', type=int, default=443)
+    parser.add_argument('--user')
+    credentials = parser.add_mutually_exclusive_group(required=True)
+    credentials.add_argument('--api-token-id', help='Checkmk API token reference ID:FILE')
+    credentials.add_argument('--api-token-stdin', action='store_true', help='Read an API token from stdin for standalone tests')
+    credentials.add_argument('--password-id', help='Checkmk password reference ID:FILE')
+    credentials.add_argument('--password-stdin', action='store_true', help='Read a password from stdin for standalone tests')
+    parser.add_argument('--timeout', type=int, default=30)
+    parser.add_argument('--no-cert-check', action='store_true')
+    parser.add_argument('--ca-file')
+    parser.add_argument('--exclude-adom', action='append', default=[], help='Explicitly exclude this ADOM from log monitoring (repeatable)')
+    parser.add_argument('--ssh-logvolume', action='store_true', help='Enable SSH volume with API credentials')
+    parser.add_argument('--ssh-user', help='Enable optional ADOM log volume via SSH')
+    parser.add_argument('--ssh-identity-file')
+    parser.add_argument('--ssh-password-id', help='Checkmk SSH password reference ID:FILE; defaults to API password')
+    parser.add_argument('--ssh-address')
+    parser.add_argument('--ssh-port', type=int, default=22)
+    parser.add_argument('--ssh-known-hosts')
+    parser.add_argument('--ssh-verify-host-key', action='store_true', help='Opt in to SSH host key verification')
+    args = parser.parse_args(argv)
+    if (args.ssh_identity_file or args.ssh_password_id) and not args.ssh_user:
+        parser.error('SSH authentication requires --ssh-user')
+    if not 1 <= args.ssh_port <= 65535:
+        parser.error('Invalid SSH port')
+    token_mode = bool(args.api_token_id or args.api_token_stdin)
+    if not token_mode and not args.user:
+        parser.error('--user is required for password authentication')
+    if not 1 <= args.port <= 65535 or args.timeout < 1:
+        parser.error('Invalid port or timeout')
+    try:
+        secret_id = args.api_token_id or args.password_id
+        if secret_id:
+            password = password_from_reference(secret_id)
+        else:
+            password = sys.stdin.readline().rstrip('\r\n')
+        if not password:
+            raise ValueError('Empty password')
+    except Exception:
+        print('FortiAnalyzer: cannot read authentication secret', file=sys.stderr)
+        return 1
+    try:
+        client = Client(args.address, args.port, args.timeout, not args.no_cert_check, args.ca_file,
+                        api_token=password if token_mode else None)
+        section = collect(client, args.user, password, args.exclude_adom)
+    except (APIError, OSError, ValueError):
+        print('FortiAnalyzer: invalid connection or TLS configuration', file=sys.stderr)
+        return 1
+    if not token_mode and (args.ssh_logvolume or args.ssh_user):
+        # Legacy SSH overrides are accepted as CLI arguments but ignored.
+        # API credentials and address are the sole source of SSH credentials.
+        section['logvolume'] = collect_logvolume_password(
+            args.address, args.user, password, args.ssh_port, args.timeout,
+            excluded=args.exclude_adom, verify_host_key=False)
+    print('<<<fortianalyzer:sep(0)>>>')
+    print(json.dumps(section, ensure_ascii=True, separators=(',', ':')))
+    # Partial errors are represented in checks, keeping successful sections usable.
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
